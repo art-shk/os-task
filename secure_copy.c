@@ -2,299 +2,255 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <stdint.h>
 #include "libcaesar.h"
 
-#define BUFFER_SIZE 8192
+#define NUM_THREADS 3
+#define TIMEOUT_SECONDS 5
 
-// Структура для передачи данных между потоками
+// Глобальные мьютексы
+pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Указатели на функции из libcaesar.so (глобальные, чтобы все потоки использовали одни)
+void (*set_key_ptr)(char) = NULL;
+void (*caesar_ptr)(void *, void *, int) = NULL;
+
 typedef struct
 {
-    int in_fd;
-    int out_fd;
-    off_t total_size;
-    volatile sig_atomic_t *keep_running;
-    pthread_mutex_t *mutex;
-    pthread_cond_t *cond; // Условная переменная
-    int done;             // Флаг завершения
-    char buffer[BUFFER_SIZE];
-    size_t buffer_size;
-    off_t bytes_processed;
-} shared_data_t;
+    char **input_files;
+    const char *output_dir;
+    int num_files;
+    int key;
+    volatile int *current_index;
+    volatile int *completed_count;
+} thread_args_t;
 
-// Глобальная переменная для обработки сигнала
-volatile sig_atomic_t keep_running = 1;
-
-// Обработчик сигнала SIGINT
-void sigint_handler(int sig)
+void get_timestamp(char *buffer, size_t size)
 {
-    keep_running = 0;
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
 }
 
-void *producer_thread(void *arg)
+const char *get_filename(const char *path)
 {
-    shared_data_t *data = (shared_data_t *)arg;
-    ssize_t bytes_read;
-    char temp_buffer[BUFFER_SIZE];
+    const char *last_slash = strrchr(path, '/');
+    return last_slash ? last_slash + 1 : path;
+}
 
-    while (keep_running)
+void log_operation(const char *filename, const char *status, long duration_ms)
+{
+    pthread_mutex_lock(&log_mutex);
+    FILE *log_file = fopen("log.txt", "a");
+    if (!log_file)
     {
-        // Читаем данные из файла
-        bytes_read = read(data->in_fd, temp_buffer, BUFFER_SIZE);
+        pthread_mutex_unlock(&log_mutex);
+        return;
+    }
 
-        if (bytes_read < 0)
+    char timestamp[32];
+    get_timestamp(timestamp, sizeof(timestamp));
+    unsigned long tid = (unsigned long)pthread_self();
+
+    fprintf(log_file, "[%s] [%lu] [%s] %s %ldms\n",
+            timestamp, tid, filename, status, duration_ms);
+
+    fclose(log_file);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+char *read_file(const char *filename, off_t *size)
+{
+    FILE *file = fopen(filename, "rb");
+    if (!file)
+        return NULL;
+
+    fseek(file, 0, SEEK_END);
+    *size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = malloc(*size);
+    if (!buffer)
+    {
+        fclose(file);
+        return NULL;
+    }
+
+    fread(buffer, 1, *size, file);
+    fclose(file);
+    return buffer;
+}
+
+int write_file(const char *filename, const char *data, off_t size)
+{
+    FILE *file = fopen(filename, "wb");
+    if (!file)
+        return -1;
+    fwrite(data, 1, size, file);
+    fclose(file);
+    return 0;
+}
+
+void *worker_thread(void *arg)
+{
+    thread_args_t *args = (thread_args_t *)arg;
+    char **input_files = args->input_files;
+    const char *output_dir = args->output_dir;
+    int key = args->key;
+    volatile int *current_index = args->current_index;
+    volatile int *completed_count = args->completed_count;
+
+    while (1)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += TIMEOUT_SECONDS;
+
+        if (pthread_mutex_timedlock(&counter_mutex, &ts) == ETIMEDOUT)
         {
-            perror("Ошибка чтения");
-            keep_running = 0;
+            unsigned long tid = (unsigned long)pthread_self();
+            printf("Возможная взаимоблокировка: поток %lu ждёт мьютекс более %d секунд\n",
+                   tid, TIMEOUT_SECONDS);
+            exit(EXIT_FAILURE);
+        }
+
+        int idx = (*current_index)++;
+        if (idx >= args->num_files)
+        {
+            pthread_mutex_unlock(&counter_mutex);
             break;
         }
 
-        if (bytes_read == 0)
+        (*completed_count)++;
+        pthread_mutex_unlock(&counter_mutex);
+
+        const char *input_file = input_files[idx];
+        const char *filename = get_filename(input_file);
+
+        char output_path[1024];
+        snprintf(output_path, sizeof(output_path), "%s/%s", output_dir, filename);
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        off_t file_size;
+        char *buffer = read_file(input_file, &file_size);
+        if (!buffer)
         {
-            // Достигнут конец файла
-            pthread_mutex_lock(data->mutex);
-            data->done = 1;
-            pthread_cond_signal(data->cond);
-            pthread_mutex_unlock(data->mutex);
-            break;
+            log_operation(filename, "ERROR_READ", 0);
+            continue;
         }
 
-        // Шифруем данные
-        caesar(temp_buffer, temp_buffer, (int)bytes_read);
+        // Используем загруженные из .so функции
+        set_key_ptr((char)key);
+        caesar_ptr(buffer, buffer, (int)file_size);
 
-        // Помещаем данные в общий буфер
-        pthread_mutex_lock(data->mutex);
-
-        while (data->buffer_size > 0 && keep_running)
+        if (write_file(output_path, buffer, file_size) != 0)
         {
-            // Ждём, пока потребитель заберёт данные
-            pthread_cond_wait(data->cond, data->mutex);
+            free(buffer);
+            log_operation(filename, "ERROR_WRITE", 0);
+            continue;
         }
 
-        if (!keep_running)
-        {
-            pthread_mutex_unlock(data->mutex);
-            break;
-        }
+        free(buffer);
 
-        // Копируем зашифрованные данные в буфер
-        memcpy(data->buffer, temp_buffer, bytes_read);
-        data->buffer_size = bytes_read;
-        data->bytes_processed += bytes_read;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        long duration_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                           (end.tv_nsec - start.tv_nsec) / 1000000;
 
-        // Сигнализируем потребителю
-        pthread_cond_signal(data->cond);
-        pthread_mutex_unlock(data->mutex);
+        log_operation(filename, "SUCCESS", duration_ms);
     }
 
     return NULL;
 }
 
-void *consumer_thread(void *arg)
-{
-    shared_data_t *data = (shared_data_t *)arg;
-    struct timespec last_update = {0};
-    struct timespec now;
-    int last_percent = -1;
-
-    while (keep_running)
-    {
-        pthread_mutex_lock(data->mutex);
-
-        // Ждём данных от производителя
-        while (data->buffer_size == 0 && !data->done && keep_running)
-        {
-            pthread_cond_wait(data->cond, data->mutex);
-        }
-
-        if (!keep_running)
-        {
-            pthread_mutex_unlock(data->mutex);
-            break;
-        }
-
-        if (data->buffer_size == 0 && data->done)
-        {
-            // Все данные обработаны
-            pthread_mutex_unlock(data->mutex);
-            break;
-        }
-
-        // Записываем данные в выходной файл
-        size_t bytes_to_write = data->buffer_size;
-        pthread_mutex_unlock(data->mutex);
-
-        ssize_t bytes_written = write(data->out_fd, data->buffer, bytes_to_write);
-
-        pthread_mutex_lock(data->mutex);
-
-        if (bytes_written < 0)
-        {
-            perror("Ошибка записи");
-            keep_running = 0;
-            pthread_mutex_unlock(data->mutex);
-            break;
-        }
-
-        // Очищаем буфер
-        data->buffer_size = 0;
-
-        // Сигнализируем производителю
-        pthread_cond_signal(data->cond);
-        pthread_mutex_unlock(data->mutex);
-
-        // Обновляем прогресс-бар (не чаще 100мс)
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (now.tv_sec - last_update.tv_sec) * 1000 +
-                          (now.tv_nsec - last_update.tv_nsec) / 1000000;
-
-        if (elapsed_ms >= 100 || data->done)
-        {
-            last_update = now;
-
-            // Вычисляем процент выполнения
-            int percent = (data->total_size > 0) ? (int)((data->bytes_processed * 100) / data->total_size) : 0;
-
-            // Обновляем только если изменился процент
-            if (percent != last_percent)
-            {
-                last_percent = percent;
-
-                // Выводим прогресс-бар
-                int bar_width = 50;
-                int filled = (percent * bar_width) / 100;
-                int empty = bar_width - filled;
-
-                printf("\r[");
-                for (int i = 0; i < filled; i++)
-                    printf("=");
-                for (int i = 0; i < empty; i++)
-                    printf(" ");
-                printf("] %3d%%", percent);
-                fflush(stdout);
-            }
-        }
-    }
-
-    printf("\n");
-    return NULL;
-}
-
-off_t get_file_size(const char *filename)
+int create_directory(const char *path)
 {
     struct stat st;
-    if (stat(filename, &st) == 0)
-        return st.st_size;
+    if (stat(path, &st) == 0)
+    {
+        return S_ISDIR(st.st_mode) ? 0 : (errno = ENOTDIR, -1);
+    }
+    if (mkdir(path, 0755) == 0 || errno == EEXIST)
+        return 0;
     return -1;
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4)
+    if (argc < 4)
     {
-        fprintf(stderr, "Использование: %s <входной_файл> <выходной_файл> <ключ>\n", argv[0]);
-        fprintf(stderr, "Пример: %s source.txt dest.txt 65\n", argv[0]);
+        fprintf(stderr, "Использование: %s <файл1> ... <выходная_директория> <ключ>\n", argv[0]);
         return 1;
     }
 
-    const char *input_file = argv[1];
-    const char *output_file = argv[2];
-    int key = atoi(argv[3]);
-
-    if (access(input_file, F_OK) != 0)
+    // Загрузка libcaesar.so
+    void *handle = dlopen("./libcaesar.so", RTLD_LAZY);
+    if (!handle)
     {
-        fprintf(stderr, "Ошибка: файл '%s' не существует\n", input_file);
+        fprintf(stderr, "Ошибка загрузки libcaesar.so: %s\n", dlerror());
         return 1;
     }
 
-    int in_fd = open(input_file, O_RDONLY);
-    if (in_fd < 0)
+    // Получение указателей на функции
+    set_key_ptr = (void (*)(char))(uintptr_t)dlsym(handle, "set_key");
+    caesar_ptr = (void (*)(void *, void *, int))(uintptr_t)dlsym(handle, "caesar");
+
+    if (!set_key_ptr || !caesar_ptr)
     {
-        perror("Ошибка открытия входного файла");
+        fprintf(stderr, "Ошибка: не найдены функции в libcaesar.so\n");
+        dlclose(handle);
         return 1;
     }
 
-    int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0)
+    int key = atoi(argv[argc - 1]);
+    const char *output_dir = argv[argc - 2];
+    int num_files = argc - 3;
+    char **input_files = &argv[1];
+
+    if (create_directory(output_dir) != 0)
     {
-        perror("Ошибка создания выходного файла");
-        close(in_fd);
+        perror("Ошибка создания выходной директории");
+        dlclose(handle);
         return 1;
     }
 
-    off_t file_size = get_file_size(input_file);
-    if (file_size < 0)
+    volatile int current_index = 0;
+    volatile int completed_count = 0;
+
+    pthread_t threads[NUM_THREADS];
+    thread_args_t args[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++)
     {
-        fprintf(stderr, "Ошибка: не удалось определить размер файла\n");
-        close(in_fd);
-        close(out_fd);
-        return 1;
+        args[i].input_files = input_files;
+        args[i].output_dir = output_dir;
+        args[i].num_files = num_files;
+        args[i].key = key;
+        args[i].current_index = &current_index;
+        args[i].completed_count = &completed_count;
+
+        if (pthread_create(&threads[i], NULL, worker_thread, &args[i]) != 0)
+        {
+            perror("Ошибка создания потока");
+            dlclose(handle);
+            return 1;
+        }
     }
 
-    // Установка обработчика сигнала SIGINT
-    struct sigaction sa;
-    sa.sa_handler = sigint_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-
-    // Установка ключа шифрования
-    set_key((char)key);
-
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-
-    shared_data_t shared_data;
-    shared_data.in_fd = in_fd;
-    shared_data.out_fd = out_fd;
-    shared_data.total_size = file_size;
-    shared_data.keep_running = &keep_running;
-    shared_data.mutex = &mutex;
-    shared_data.cond = &cond;
-    shared_data.done = 0;
-    shared_data.buffer_size = 0;
-    shared_data.bytes_processed = 0;
-
-    // Создание потоков
-    pthread_t producer, consumer;
-
-    if (pthread_create(&producer, NULL, producer_thread, &shared_data) != 0)
+    for (int i = 0; i < NUM_THREADS; i++)
     {
-        perror("Ошибка создания потока-производителя");
-        close(in_fd);
-        close(out_fd);
-        return 1;
+        pthread_join(threads[i], NULL);
     }
 
-    if (pthread_create(&consumer, NULL, consumer_thread, &shared_data) != 0)
-    {
-        perror("Ошибка создания потока-потребителя");
-        keep_running = 0;
-        pthread_join(producer, NULL);
-        close(in_fd);
-        close(out_fd);
-        return 1;
-    }
-
-    pthread_join(producer, NULL);
-    pthread_join(consumer, NULL);
-
-    close(in_fd);
-    close(out_fd);
-
-    if (!keep_running)
-    {
-        printf("\nОперация прервана пользователем\n");
-        // Удаляем частично записанный файл
-        unlink(output_file);
-        return 1;
-    }
-
-    printf("Копирование и шифрование завершены успешно\n");
+    dlclose(handle); // Закрываем библиотеку
     return 0;
 }
