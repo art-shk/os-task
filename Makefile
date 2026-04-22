@@ -32,8 +32,8 @@ $(SECURE_COPY): secure_copy.c libcaesar.h
 test: $(LIB) $(TEST_PROG)
 	./$(TEST_PROG) ./$(LIB) 'X' input.txt output.txt
 
-# Тест задания 3
-test3: $(LIB) $(SECURE_COPY)
+# Тест задания 4
+test4: $(LIB) $(SECURE_COPY)
 	./$(SECURE_COPY) \
 		${INPUT_DIR}/f1.txt \
 		${INPUT_DIR}/f2.txt \
@@ -46,4 +46,4 @@ clean:
 	rm -f $(LIB) $(TEST_PROG) $(SECURE_COPY) log.txt
 	rm -rf $(TEST_DIR)
 
-.PHONY: all install test test3 clean
+.PHONY: all install test test4 clean
