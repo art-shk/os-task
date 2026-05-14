@@ -42,6 +42,10 @@ test4: $(LIB) $(SECURE_COPY)
 		${INPUT_DIR}/f5.txt \
 		${OUTPUT_DIR} 65
 
+# Тест задания 5
+test5: $(LIB) $(SECURE_COPY)
+	./$(SECURE_COPY) --test
+
 clean:
 	rm -f $(LIB) $(TEST_PROG) $(SECURE_COPY) log.txt
 	rm -rf $(TEST_DIR)
